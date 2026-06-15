@@ -129,6 +129,7 @@ data AppConfig = AppConfig
   , configRoleSettings              :: RoleSettings
   , configRoleIsoLvl                :: RoleIsolationLvl
   , configInternalSCQuerySleep      :: Maybe Int32
+  , configOgcApiEnabled             :: Bool
   }
 
 data LogLevel = LogCrit | LogError | LogWarn | LogInfo | LogDebug
@@ -211,12 +212,13 @@ toText conf =
       ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
       ,("admin-server-unix-socket",  q . maybe mempty T.pack . configAdminServerUnixSocket)
       ,("admin-server-unix-socket-mode", q . T.pack . showAdminSocketMode)
+      ,("ogc-api-enabled",               T.toLower . show . configOgcApiEnabled)
       ]
 
     -- quote all app.settings
     appSettings = second q <$> configAppSettings conf
 
-    -- quote strings and replace " with \"
+    -- quote strings and replace " with \\" 
     q s = "\"" <> T.replace "\"" "\\\"" s <> "\""
 
     dumpQi :: QualifiedIdentifier -> Text
@@ -236,8 +238,6 @@ toText conf =
     showSocketMode c = showOct (configServerUnixSocketMode c) mempty
     showAdminSocketMode c = showOct (configAdminServerUnixSocketMode c) mempty
 
--- This class is needed for the polymorphism of overrideFromDbOrEnvironment
--- because C.required and C.optional have different signatures
 class JustIfMaybe a b where
   justIfMaybe :: a -> b
 
@@ -247,12 +247,9 @@ instance JustIfMaybe a a where
 instance JustIfMaybe a (Maybe a) where
   justIfMaybe = Just
 
--- | Reads and parses the config and overrides its parameters from env vars,
--- files or db settings.
 readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> RoleSettings -> RoleIsolationLvl -> IO (Either Text AppConfig)
 readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
   env <- readPGRSTEnvironment
-  -- if no filename provided, start with an empty map to read config from environment
   conf <- maybe (return $ Right M.empty) loadConfig optPath
 
   case C.runParser (parser optPath env dbSettings roleSettings roleIsolationLvl) =<< mapLeft show conf of
@@ -261,7 +258,6 @@ readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
     Right parsedConfig ->
       mapLeft show <$> decodeLoadFiles parsedConfig
   where
-    -- Both C.ParseError and IOError are shown here
     loadConfig :: FilePath -> IO (Either SomeException C.Config)
     loadConfig = try . C.load
 
@@ -333,11 +329,12 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
     <*> pure roleSettings
     <*> pure roleIsolationLvl
     <*> optInt "internal-schema-cache-query-sleep"
+    <*> (fromMaybe False <$> optBool "ogc-api-enabled")
   where
     parseErrorVerbosity :: C.Key -> C.Parser C.Config Verbosity
     parseErrorVerbosity k =
       optString k >>= \case
-        Nothing        -> pure Verbose -- default
+        Nothing        -> pure Verbose
         Just "minimal" -> pure Minimal
         Just "verbose" -> pure Verbose
         Just _         -> fail "Invalid client-error-verbosity. Check your configuration."
@@ -375,7 +372,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
     parseSocketFileMode :: C.Key -> C.Parser C.Config FileMode
     parseSocketFileMode k =
       optString k >>= \case
-        Nothing -> pure 432 -- return default 660 mode if no value was provided
+        Nothing -> pure 432
         Just fileModeText ->
           case readOct $ T.unpack fileModeText of
             []              ->
@@ -415,7 +412,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
     parseTxEnd :: C.Key -> ((Bool, Bool) -> Bool) -> C.Parser C.Config Bool
     parseTxEnd k f =
       optString k >>= \case
-        --                                          RollbackAll AllowOverride
         Nothing                        -> pure $ f (False,      False)
         Just "commit"                  -> pure $ f (False,      False)
         Just "commit-allow-override"   -> pure $ f (False,      True)
@@ -449,8 +445,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
     optStringOrURI :: C.Key -> C.Parser C.Config (Maybe Text)
     optStringOrURI k = do
       stringOrURI <- mfilter (/= "") <$> overrideFromDbOrEnvironment C.optional k coerceText
-      -- If the string contains ':' then it should
-      -- be a valid URI according to RFC 3986
       case stringOrURI of
         Just s  -> if T.isInfixOf ":" s then validateURI s else return (Just s)
         Nothing -> return Nothing
@@ -491,10 +485,8 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
     coerceBool :: C.Value -> Maybe Bool
     coerceBool (C.Bool b)   = Just b
     coerceBool (C.String s) =
-      -- parse all kinds of text: True, true, TRUE, "true", ...
       case readMaybe $ T.toTitle $ T.filter isAlpha $ toS s of
         Just b  -> Just b
-        -- numeric instead?
         Nothing -> (> 0) <$> (readMaybe s :: Maybe Integer)
     coerceBool _            = Nothing
 
@@ -510,9 +502,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
     defaultServerHost :: Maybe Text -> Text
     defaultServerHost = fromMaybe "!4"
 
--- | Read the JWT secret from a file if configJwtSecret is actually a
--- filepath(has @ as its prefix). To check if the JWT secret is provided is
--- in fact a file path, it must be decoded as 'Text' to be processed.
 readSecretFile :: AppConfig -> IO AppConfig
 readSecretFile conf =
   maybe (return conf) readSecret maybeFilename
@@ -534,11 +523,6 @@ decodeSecret conf@AppConfig{..} =
     decodeB64 = B64.decode . encodeUtf8 . T.strip . replaceUrlChars . decodeUtf8
     replaceUrlChars = T.replace "_" "/" . T.replace "-" "+" . T.replace "." "="
 
--- | Parse `jwt-secret` configuration option and turn into a JWKS.
---
--- There are three ways to specify `jwt-secret`: text secret, JSON Web Key
--- (JWK), or JSON Web Key Set (JWKS). The first two are converted into a JwkSet
--- with one key and the last is converted as is.
 decodeJWKS :: AppConfig -> IO AppConfig
 decodeJWKS conf = do
   jwks <- case configJwtSecret conf of
@@ -559,7 +543,6 @@ parseSecret bytes =
       | BS.length bytes < 32 = Left "The JWT secret must be at least 32 characters long."
       | otherwise = Right secret
 
--- | Read database uri from a separate file if `db-uri` is a filepath.
 readDbUriFile :: Maybe Text -> AppConfig -> IO AppConfig
 readDbUriFile maybeDbUri conf =
   case maybeDbUri of
@@ -574,15 +557,12 @@ readDbUriFile maybeDbUri conf =
 
 type Environment = M.Map [Char] Text
 
--- | Read environment variables that start with PGRST_
 readPGRSTEnvironment :: IO Environment
 readPGRSTEnvironment =
   M.map T.pack . M.fromList . filter (isPrefixOf "PGRST_" . fst) <$> getEnvironment
 
 data PGConnString = PGURI | PGKeyVal
 
--- Uses same logic as libpq recognized_connection_string
--- https://github.com/postgres/postgres/blob/5eafacd2797dc0b04a0bde25fbf26bf79903e7c2/src/interfaces/libpq/fe-connect.c#L5923-L5936
 pgConnString :: Text -> Maybe PGConnString
 pgConnString conn | uriDesignator `T.isPrefixOf` conn || shortUriDesignator `T.isPrefixOf` conn = Just PGURI
                   | "=" `T.isInfixOf` conn                                                      = Just PGKeyVal
@@ -591,66 +571,11 @@ pgConnString conn | uriDesignator `T.isPrefixOf` conn || shortUriDesignator `T.i
     uriDesignator = "postgresql://"
     shortUriDesignator = "postgres://"
 
--- | Adds a `fallback_application_name` value to the connection string. This allows querying the PostgREST version on pg_stat_activity.
---
--- >>> let ver = "11.1.0 (5a04ec7)"::ByteString
--- >>> let strangeVer = "11'1&0@#$%,.:\"[]{}?+^()=asdfqwer"::ByteString
---
--- >>> addFallbackAppName ver "postgres://user:pass@host:5432/postgres"
--- "postgres://user:pass@host:5432/postgres?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName ver "postgres://user:pass@host:5432/postgres?"
--- "postgres://user:pass@host:5432/postgres?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName ver "postgres:///postgres?host=server&port=5432"
--- "postgres:///postgres?host=server&port=5432&fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName ver "postgresql://"
--- "postgresql://?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName strangeVer "postgres:///postgres?host=server&port=5432"
--- "postgres:///postgres?host=server&port=5432&fallback_application_name=PostgREST%2011%271%260%40%23%24%25%2C.%3A%22%5B%5D%7B%7D%3F%2B%5E%28%29%3Dasdfqwer"
---
--- >>> addFallbackAppName ver "postgres://user:invalid_chars[]#@host:5432/postgres"
--- "postgres://user:invalid_chars[]#@host:5432/postgres?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName ver "host=localhost port=5432 dbname=postgres"
--- "host=localhost port=5432 dbname=postgres fallback_application_name='PostgREST 11.1.0 (5a04ec7)'"
---
--- >>> addFallbackAppName strangeVer "host=localhost port=5432 dbname=postgres"
--- "host=localhost port=5432 dbname=postgres fallback_application_name='PostgREST 11\\'1&0@#$%,.:\"[]{}?+^()=asdfqwer'"
---
--- works with passwords containing `?`
--- >>> addFallbackAppName ver "postgres://admin2:?pass?special?@localhost:5432/postgres"
--- "postgres://admin2:?pass?special?@localhost:5432/postgres?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName ver "postgresql://?dbname=postgres&host=/run/user/1000/postgrest/postgrest-with-postgresql-16-BuR/socket&user=some_protected_user&password=invalid_pass"
--- "postgresql://?dbname=postgres&host=/run/user/1000/postgrest/postgrest-with-postgresql-16-BuR/socket&user=some_protected_user&password=invalid_pass&fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
---
--- >>> addFallbackAppName ver "postgresql:///postgres?host=/run/user/1000/postgrest/postgrest-with-postgresql-16-BuR/socket&user=some_protected_user&password=invalid_pass"
--- "postgresql:///postgres?host=/run/user/1000/postgrest/postgrest-with-postgresql-16-BuR/socket&user=some_protected_user&password=invalid_pass&fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
 addFallbackAppName :: ByteString -> Text -> Text
 addFallbackAppName version dbUri = addConnStringOption dbUri "fallback_application_name" pgrstVer
   where
     pgrstVer = "PostgREST " <> T.decodeUtf8 version
 
--- | Adds `target_session_attrs=read-write` to the connection string. This allows using PostgREST listener when multiple hosts are specified in the connection string.
---
--- >>> addTargetSessionAttrs "postgres:///postgres?host=/dir/0kN/socket_replica_24378,/dir/0kN/socket"
--- "postgres:///postgres?host=/dir/0kN/socket_replica_24378,/dir/0kN/socket&target_session_attrs=read-write"
---
--- >>> addTargetSessionAttrs "postgresql://host1:123,host2:456/somedb"
--- "postgresql://host1:123,host2:456/somedb?target_session_attrs=read-write"
---
--- >>> addTargetSessionAttrs "postgresql://host1:123,host2:456/somedb?fallback_application_name=foo"
--- "postgresql://host1:123,host2:456/somedb?fallback_application_name=foo&target_session_attrs=read-write"
---
--- adds target_session_attrs despite one existing
--- >>> addTargetSessionAttrs "postgresql://host1:123,host2:456/somedb?target_session_attrs=read-only"
--- "postgresql://host1:123,host2:456/somedb?target_session_attrs=read-only&target_session_attrs=read-write"
---
--- >>> addTargetSessionAttrs "host=localhost port=5432 dbname=postgres"
--- "host=localhost port=5432 dbname=postgres target_session_attrs='read-write'"
 addTargetSessionAttrs :: Text -> Text
 addTargetSessionAttrs dbUri = addConnStringOption dbUri "target_session_attrs" "read-write"
 
@@ -672,9 +597,8 @@ addConnStringOption dbUri key val = dbUri <>
   where
     uriFmt = key <> "=" <> toS (escapeURIString isUnescapedInURIComponent $ toS val)
     keyValFmt = key <> "=" <> "'" <> T.replace "'" "\\'" val <> "'"
-    lookAtOptions x =  T.breakOn "?" . snd $ T.breakOnEnd "@" x -- start from after `@` to not mess passwords that include `?`, see https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING-URIS
+    lookAtOptions x =  T.breakOn "?" . snd $ T.breakOnEnd "@" x
 
--- | Example config file displayed on postgrest "--example" flag
 exampleConfigFile :: [Char]
 exampleConfigFile = S.unlines
   [ "## Admin server used for checks. It's disabled by default unless a port is specified."
@@ -779,6 +703,9 @@ exampleConfigFile = S.unlines
   , ""
   , "## Configurable CORS origins"
   , "# server-cors-allowed-origins = \"\""
+  , ""
+  , "## Enable starter OGC API endpoints"
+  , "# ogc-api-enabled = false"
   , ""
   , "server-host = \"!4\""
   , "server-port = 3000"
