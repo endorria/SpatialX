@@ -53,32 +53,24 @@ import qualified PostgREST.MediaType              as MediaType
 
 import Protolude
 
-{-|
-  Describes what the user wants to do. This data type is a
-  translation of the raw elements of an HTTP request into domain
-  specific language.  There is no guarantee that the intent is
-  sensible, it is up to a later stage of processing to determine
-  if it is an action we are able to perform.
--}
 data ApiRequest = ApiRequest {
-    iAction              :: Action                           -- ^ Action on the resource
-  , iRange               :: HM.HashMap Text NonnegRange      -- ^ Requested range of rows within response
-  , iTopLevelRange       :: NonnegRange                      -- ^ Requested range of rows from the top level
-  , iPayload             :: Maybe Payload                    -- ^ Data sent by client and used for mutation actions
-  , iPreferences         :: Preferences.Preferences          -- ^ Prefer header values
+    iAction              :: Action
+  , iRange               :: HM.HashMap Text NonnegRange
+  , iTopLevelRange       :: NonnegRange
+  , iPayload             :: Maybe Payload
+  , iPreferences         :: Preferences.Preferences
   , iQueryParams         :: QueryParams.QueryParams
-  , iColumns             :: S.Set FieldName                  -- ^ parsed columns from &columns parameter and payload
-  , iHeaders             :: [(ByteString, ByteString)]       -- ^ HTTP request headers
-  , iCookies             :: [(ByteString, ByteString)]       -- ^ Request Cookies
-  , iPath                :: ByteString                       -- ^ Raw request path
-  , iMethod              :: ByteString                       -- ^ Raw request method
-  , iSchema              :: Schema                           -- ^ The request schema. Can vary depending on profile headers.
-  , iNegotiatedByProfile :: Bool                             -- ^ If schema was was chosen according to the profile spec https://www.w3.org/TR/dx-prof-conneg/
-  , iAcceptMediaType     :: [MediaType]                      -- ^ The resolved media types in the Accept, considering quality(q) factors
-  , iContentMediaType    :: MediaType                        -- ^ The media type in the Content-Type header
+  , iColumns             :: S.Set FieldName
+  , iHeaders             :: [(ByteString, ByteString)]
+  , iCookies             :: [(ByteString, ByteString)]
+  , iPath                :: ByteString
+  , iMethod              :: ByteString
+  , iSchema              :: Schema
+  , iNegotiatedByProfile :: Bool
+  , iAcceptMediaType     :: [MediaType]
+  , iContentMediaType    :: MediaType
   }
 
--- | Examines HTTP request and translates it into user intent.
 userApiRequest :: AppConfig -> Preferences.Preferences -> Request -> RequestBody -> Either ApiRequestError ApiRequest
 userApiRequest conf prefs req reqBody = do
   resource <- getResource conf $ pathInfo req
@@ -113,22 +105,31 @@ userApiRequest conf prefs req reqBody = do
     contentMediaType = maybe MTApplicationJSON MediaType.decodeMediaType $ lookupHeader "content-type"
     actIsInvokeSafe x = case x of {ActDb (ActRoutine _  (InvRead _)) -> True; _ -> False}
 
--- | Parses the Prefer header
 userPreferences :: AppConfig -> Request -> TimezoneNames -> Preferences.Preferences
 userPreferences conf req timezones = Preferences.fromHeaders (configDbTxAllowOverride conf) timezones $ requestHeaders req
 
--- | Obtains the Bearer Auth
 userBearerAuth :: Request -> Maybe ByteString
 userBearerAuth req = extractBearerAuth =<< lookup hAuthorization (requestHeaders req)
 
 getResource :: AppConfig -> [Text] -> Either ApiRequestError Resource
-getResource AppConfig{configOpenApiMode, configDbRootSpec} = \case
-  []             ->
-      case (configOpenApiMode,configDbRootSpec) of
-        (OADisabled,_) -> Left OpenAPIDisabled
-        (_, Just qi)   -> Right $ ResourceRoutine (qiName qi)
-        (_, Nothing)   -> Right ResourceSchema
-
+getResource AppConfig{configOpenApiMode, configDbRootSpec, configOgcApiEnabled} = \case
+  []
+    | configOgcApiEnabled -> Right ResourceOgcLanding
+    | otherwise ->
+        case (configOpenApiMode,configDbRootSpec) of
+          (OADisabled,_) -> Left OpenAPIDisabled
+          (_, Just qi)   -> Right $ ResourceRoutine (qiName qi)
+          (_, Nothing)   -> Right ResourceSchema
+  ["conformance"]
+    | configOgcApiEnabled -> Right ResourceOgcConformance
+  ["collections"]
+    | configOgcApiEnabled -> Right ResourceOgcCollections
+  ["collections", collectionId]
+    | configOgcApiEnabled -> Right $ ResourceOgcCollection collectionId
+  ["collections", collectionId, "items"]
+    | configOgcApiEnabled -> Right $ ResourceOgcCollectionItems collectionId
+  ["collections", collectionId, "items", featureId]
+    | configOgcApiEnabled -> Right $ ResourceOgcCollectionItem collectionId featureId
   [table]        -> Right $ ResourceRelation table
   ["rpc", pName] -> Right $ ResourceRoutine pName
   _              -> Left InvalidResourcePath
@@ -154,21 +155,43 @@ getAction resource schema method =
     (ResourceSchema, "GET")           -> Right . ActDb $ ActSchemaRead schema False
     (ResourceSchema, "OPTIONS")       -> Right ActSchemaInfo
 
+    (ResourceOgcLanding, "HEAD")      -> Right ActOgcLanding
+    (ResourceOgcLanding, "GET")       -> Right ActOgcLanding
+    (ResourceOgcLanding, "OPTIONS")   -> Right ActOgcCollectionsInfo
+
+    (ResourceOgcConformance, "HEAD")    -> Right ActOgcConformance
+    (ResourceOgcConformance, "GET")     -> Right ActOgcConformance
+    (ResourceOgcConformance, "OPTIONS") -> Right ActOgcCollectionsInfo
+
+    (ResourceOgcCollections, "HEAD")    -> Right ActOgcCollections
+    (ResourceOgcCollections, "GET")     -> Right ActOgcCollections
+    (ResourceOgcCollections, "OPTIONS") -> Right ActOgcCollectionsInfo
+
+    (ResourceOgcCollection collectionId, "HEAD")    -> Right $ ActOgcCollection (qi collectionId)
+    (ResourceOgcCollection collectionId, "GET")     -> Right $ ActOgcCollection (qi collectionId)
+    (ResourceOgcCollection _, "OPTIONS")            -> Right ActOgcCollectionsInfo
+
+    (ResourceOgcCollectionItems collectionId, "HEAD")    -> Right $ ActOgcCollectionItems (qi collectionId) True
+    (ResourceOgcCollectionItems collectionId, "GET")     -> Right $ ActOgcCollectionItems (qi collectionId) False
+    (ResourceOgcCollectionItems collectionId, "OPTIONS") -> Right $ ActOgcCollectionItemsInfo (qi collectionId)
+
+    (ResourceOgcCollectionItem collectionId featureId, "HEAD") -> Right $ ActOgcCollectionItem (qi collectionId) featureId True
+    (ResourceOgcCollectionItem collectionId featureId, "GET")  -> Right $ ActOgcCollectionItem (qi collectionId) featureId False
+    (ResourceOgcCollectionItem collectionId _, "OPTIONS")      -> Right $ ActOgcCollectionItemsInfo (qi collectionId)
+
     _                                 -> Left $ UnsupportedMethod method
   where
     qi = QualifiedIdentifier schema
-
 
 getSchema :: AppConfig -> RequestHeaders -> ByteString -> Either ApiRequestError (Schema, Bool)
 getSchema AppConfig{configDbSchemas} hdrs method = do
   case profile of
     Just p | p `notElem` configDbSchemas -> Left $ UnacceptableSchema p $ toList configDbSchemas
            | otherwise                   -> Right (p, True)
-    Nothing -> Right (defaultSchema, length configDbSchemas /= 1) -- if we have many schemas, assume the default schema was negotiated
+    Nothing -> Right (defaultSchema, length configDbSchemas /= 1)
   where
     defaultSchema = NonEmptyList.head configDbSchemas
     profile = case method of
-      -- POST/PATCH/PUT/DELETE don't use the same header as per the spec
       "DELETE" -> contentProfile
       "PATCH"  -> contentProfile
       "POST"   -> contentProfile
@@ -184,14 +207,9 @@ getRanges method QueryParams{qsRanges} hdrs
   | method == "PUT" && topLevelRange /= allRange = Left PutLimitNotAllowedError
   | otherwise = Right (topLevelRange, ranges)
   where
-    -- According to the RFC (https://www.rfc-editor.org/rfc/rfc9110.html#name-range),
-    -- the Range header must be ignored for all methods other than GET
     headerRange = if method == "GET" then rangeRequested hdrs else allRange
     limitRange = fromMaybe allRange (HM.lookup "limit" qsRanges)
     headerAndLimitRange = rangeIntersection headerRange limitRange
-    -- Bypass all the ranges and send only the limit zero range (0 <= x <= -1) if
-    -- limit=0 is present in the query params (not allowed for the Range header)
     ranges = HM.insert "limit" (convertToLimitZeroRange limitRange headerAndLimitRange) qsRanges
-    -- The only emptyRange allowed is the limit zero range
     isInvalidRange = topLevelRange == emptyRange && not (hasLimitZero limitRange)
-    topLevelRange = fromMaybe allRange $ HM.lookup "limit" ranges -- if no limit is specified, get all the request rows
+    topLevelRange = fromMaybe allRange $ HM.lookup "limit" ranges
